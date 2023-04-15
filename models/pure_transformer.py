@@ -11,8 +11,9 @@ import lib.utils as utils
 from models.basic_model import BasicModel
 
 from models.backbone.swin_transformer_backbone import SwinTransformer as STBackbone
-from models.encoder_decoder.PureT_encoder import Encoder
-from models.encoder_decoder.PureT_decoder import Decoder
+from models.encoder_decoder.Spiking_PureT_encoder import Encoder
+from models.encoder_decoder.Spiking_PureT_decoder import Decoder
+from models.spike_layer import *
 
 # For masked MSA
 """
@@ -33,10 +34,10 @@ class PureT(BasicModel):
     def __init__(self):
         super(PureT, self).__init__()
         self.vocab_size = cfg.MODEL.VOCAB_SIZE + 1
-        
+
         self.backbone = STBackbone(
-            img_size=384, 
-            embed_dim=192, 
+            img_size=384,
+            embed_dim=192,
             depths=[2, 2, 18, 2],
             num_heads=[6, 12, 24, 48],
             window_size=12,
@@ -50,7 +51,7 @@ class PureT(BasicModel):
         for _name, _weight in self.backbone.named_parameters():
             _weight.requires_grad = False
             # print(_name, _weight.requires_grad)
-        
+
         # raw Dimension to Model Dimension
         if cfg.MODEL.ATT_FEATS_DIM == cfg.MODEL.ATT_FEATS_EMBED_DIM:
             self.att_embed = nn.Identity()
@@ -61,37 +62,38 @@ class PureT(BasicModel):
                 nn.LayerNorm(cfg.MODEL.ATT_FEATS_EMBED_DIM) if cfg.MODEL.ATT_FEATS_NORM == True else nn.Identity(),
                 nn.Dropout(cfg.MODEL.DROPOUT_ATT_EMBED)
             )
-        
+
         use_gx = True
         self.encoder = Encoder(
-            embed_dim=cfg.MODEL.ATT_FEATS_EMBED_DIM, 
-            input_resolution=(12, 12), 
-            depth=cfg.MODEL.BILINEAR.ENCODE_LAYERS, 
-            num_heads=cfg.MODEL.BILINEAR.HEAD, 
+            embed_dim=cfg.MODEL.ATT_FEATS_EMBED_DIM,
+            input_resolution=(12, 12),
+            depth=cfg.MODEL.BILINEAR.ENCODE_LAYERS,
+            num_heads=cfg.MODEL.BILINEAR.HEAD,
             window_size=6,
             shift_size=3,
             mlp_ratio=4,
             dropout=0.1,
             use_gx = use_gx
         )
-        
+
         self.decoder = Decoder(
-            vocab_size = self.vocab_size, 
-            embed_dim = cfg.MODEL.BILINEAR.DIM, 
+            vocab_size = self.vocab_size,
+            embed_dim = cfg.MODEL.BILINEAR.DIM,
             depth = cfg.MODEL.BILINEAR.DECODE_LAYERS,
-            num_heads = cfg.MODEL.BILINEAR.HEAD, 
-            dropout = cfg.MODEL.BILINEAR.DECODE_DROPOUT, 
+            num_heads = cfg.MODEL.BILINEAR.HEAD,
+            dropout = cfg.MODEL.BILINEAR.DECODE_DROPOUT,
             ff_dropout = cfg.MODEL.BILINEAR.DECODE_FF_DROPOUT,
             use_gx = use_gx
         )
-        
+        self.lif = PLMP()
+
     def forward(self, **kwargs):
         att_feats = kwargs[cfg.PARAM.ATT_FEATS]
         seq = kwargs[cfg.PARAM.INPUT_SENT]
-        
+
         # backbone forward
         att_feats = self.backbone(att_feats)
-        
+
         # att_mask for features
         att_mask = kwargs[cfg.PARAM.ATT_FEATS_MASK]
         att_mask = utils.expand_tensor(att_mask, cfg.DATA_LOADER.SEQ_PER_IMG)
@@ -107,6 +109,7 @@ class PureT(BasicModel):
         ##############################################
 
         att_feats = self.att_embed(att_feats)
+        att_feats = self.lif(att_feats)
         gx, encoder_out = self.encoder(att_feats, att_mask)
         decoder_out = self.decoder(gx, seq, encoder_out, seq_mask, att_mask)
         return F.log_softmax(decoder_out, dim=-1)
@@ -115,7 +118,7 @@ class PureT(BasicModel):
         wt = kwargs[cfg.PARAM.WT]
         state = kwargs[cfg.PARAM.STATE]
         encoder_out = kwargs[cfg.PARAM.ATT_FEATS]
-        
+
         att_mask = kwargs[cfg.PARAM.ATT_FEATS_MASK]
         gx = kwargs[cfg.PARAM.GLOBAL_FEAT]
         # p_att_feats = kwargs[cfg.PARAM.P_ATT_FEATS]
@@ -126,12 +129,12 @@ class PureT(BasicModel):
             ys = wt.unsqueeze(1)
         else:
             ys = torch.cat([state[0][0], wt.unsqueeze(1)], dim=1)
-            
+
         seq_mask = subsequent_mask(ys.size(1)).to(encoder_out.device).type(torch.cuda.FloatTensor)[:, -1, :].unsqueeze(1)
-        
+
         # [B, 1, Vocab_Size] --> [B, Vocab_Size]
         decoder_out = self.decoder(gx, ys[:, -1].unsqueeze(-1), encoder_out, seq_mask, att_mask).squeeze(1)
-        
+
         logprobs = F.log_softmax(decoder_out, dim=-1)
         return logprobs, [ys.unsqueeze(0)]
 
@@ -205,7 +208,7 @@ class PureT(BasicModel):
             outputs.append(selected_words.unsqueeze(-1))
 
             this_word_logprob = torch.gather(word_logprob, 1,
-                selected_beam.unsqueeze(-1).expand(batch_size, beam_size, word_logprob.shape[-1]))
+                                             selected_beam.unsqueeze(-1).expand(batch_size, beam_size, word_logprob.shape[-1]))
             this_word_logprob = torch.gather(this_word_logprob, 2, selected_words.unsqueeze(-1))
             log_probs = list(
                 torch.gather(o, 1, selected_beam.unsqueeze(-1).expand(batch_size, beam_size, 1)) for o in log_probs)
@@ -233,7 +236,7 @@ class PureT(BasicModel):
                 kwargs[cfg.PARAM.GLOBAL_FEAT] = gx
                 kwargs[cfg.PARAM.ATT_FEATS_MASK] = att_mask
                 # kwargs[cfg.PARAM.P_ATT_FEATS] = p_att_feats_tmp
- 
+
         seq_logprob, sort_idxs = torch.sort(seq_logprob, 1, descending=True)
         outputs = torch.cat(outputs, -1)
         outputs = torch.gather(outputs, 1, sort_idxs.expand(batch_size, beam_size, cfg.MODEL.SEQ_LEN))
@@ -258,7 +261,7 @@ class PureT(BasicModel):
         gx, encoder_out = self.encoder(att_feats, att_mask)
         # p_att_feats = self.decoder.precompute(encoder_out)
         self.decoder.init_buffer(batch_size)
-        
+
         state = None
         sents = Variable(torch.zeros((batch_size, cfg.MODEL.SEQ_LEN), dtype=torch.long).cuda())
         logprobs = Variable(torch.zeros(batch_size, cfg.MODEL.SEQ_LEN).cuda())
@@ -267,13 +270,13 @@ class PureT(BasicModel):
         kwargs[cfg.PARAM.ATT_FEATS] = encoder_out
         kwargs[cfg.PARAM.GLOBAL_FEAT] = gx
         # kwargs[cfg.PARAM.P_ATT_FEATS] = p_att_feats
-        
+
         # inference word by word
         for t in range(cfg.MODEL.SEQ_LEN):
             kwargs[cfg.PARAM.WT] = wt
             kwargs[cfg.PARAM.STATE] = state
             logprobs_t, state = self.get_logprobs_state(**kwargs)
-            
+
             if greedy_decode:
                 logP_t, wt = torch.max(logprobs_t, 1)
             else:
@@ -290,7 +293,7 @@ class PureT(BasicModel):
                 break
         self.decoder.clear_buffer()
         return sents, logprobs
-    
+
     def flops(self):
         flops = 0
         flops += self.backbone.flops()
@@ -301,19 +304,19 @@ class PureT(BasicModel):
         flops += self.encoder.flops()
         # flops += self.decoder.flops()
         return flops
-    
+
 # 采用 Base SwinTransformer
 # pre-trained on Regular ImageNet-1K
 class PureT_Base(PureT):
     def __init__(self):
         super(PureT_Base, self).__init__()
         self.vocab_size = cfg.MODEL.VOCAB_SIZE + 1
-        
+
         del self.backbone
-        
+
         self.backbone = STBackbone(
-            img_size=384, 
-            embed_dim=128, 
+            img_size=384,
+            embed_dim=128,
             depths=[2, 2, 18, 2],
             num_heads=[4, 8, 16, 32],
             window_size=12,
@@ -327,7 +330,7 @@ class PureT_Base(PureT):
         for _name, _weight in self.backbone.named_parameters():
             _weight.requires_grad = False
             # print(_name, _weight.requires_grad)
-        
+
         # raw Dimension to Model Dimension
         if cfg.MODEL.ATT_FEATS_DIM == cfg.MODEL.ATT_FEATS_EMBED_DIM:
             self.att_embed = nn.Identity()
@@ -338,19 +341,19 @@ class PureT_Base(PureT):
                 nn.LayerNorm(cfg.MODEL.ATT_FEATS_EMBED_DIM) if cfg.MODEL.ATT_FEATS_NORM == True else nn.Identity(),
                 nn.Dropout(cfg.MODEL.DROPOUT_ATT_EMBED)
             )
-            
+
 # 采用 Base SwinTransformer
 # pre-trained on Regular ImageNet-1K
 class PureT_Base_22K(PureT):
     def __init__(self):
         super(PureT_Base_22K, self).__init__()
         self.vocab_size = cfg.MODEL.VOCAB_SIZE + 1
-        
+
         del self.backbone
-        
+
         self.backbone = STBackbone(
-            img_size=384, 
-            embed_dim=128, 
+            img_size=384,
+            embed_dim=128,
             depths=[2, 2, 18, 2],
             num_heads=[4, 8, 16, 32],
             window_size=12,
@@ -364,7 +367,7 @@ class PureT_Base_22K(PureT):
         for _name, _weight in self.backbone.named_parameters():
             _weight.requires_grad = False
             # print(_name, _weight.requires_grad)
-        
+
         # raw Dimension to Model Dimension
         if cfg.MODEL.ATT_FEATS_DIM == cfg.MODEL.ATT_FEATS_EMBED_DIM:
             self.att_embed = nn.Identity()

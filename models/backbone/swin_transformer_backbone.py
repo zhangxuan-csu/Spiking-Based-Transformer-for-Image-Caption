@@ -577,7 +577,7 @@ class SwinTransformer(nn.Module):
         x = self.head(x)
         return x
     """
-    
+
     # forward w/o head
     def forward(self, x):
         # extract image features，[B, L, D]
@@ -591,7 +591,7 @@ class SwinTransformer(nn.Module):
 
         x = self.norm(x)  # B L C
         return x
-    
+
     def load_weights(self, pretrained_model):
         checkpoint = torch.load(pretrained_model, map_location='cpu')
         # print(checkpoint['patch_embed.proj.bias'])
